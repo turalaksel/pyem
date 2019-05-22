@@ -38,43 +38,79 @@ def main(args):
     log.setLevel(logging.getLevelName(args.loglevel.upper()))
     df = star.parse_star(args.input, keep_index=False)
     star.augment_star_ucsf(df)
+    maxshift = np.round(np.max(np.abs(df[star.Relion.ORIGINS].values)))
+
     if args.map is not None:
-        vol = mrc.read(args.map, inc_header=False, compat="relion")
-        if args.mask is not None:
-            mask = mrc.read(args.mask, inc_header=False, compat="relion")
-            vol *= mask
+        if args.map.endswith(".npy"):
+            log.info("Reading precomputed 3D FFT of volume")
+            f3d = np.load(args.map)
+            log.info("Finished reading 3D FFT of volume")
+            if args.size is None:
+                args.size = (f3d.shape[0] - 3) // args.pfac
+        else:
+            vol = mrc.read(args.map, inc_header=False, compat="relion")
+            if args.mask is not None:
+                mask = mrc.read(args.mask, inc_header=False, compat="relion")
+                vol *= mask
+            if args.size is None:
+                args.size = vol.shape[0]
+            if args.crop is not None and args.size // 2 < maxshift + args.crop // 2:
+                log.error("Some shifts are too large to crop (maximum crop is %d)" % (args.size - 2 * maxshift))
+                return 1
+            log.info("Preparing 3D FFT of volume")
+            f3d = vop.vol_ft(vol, pfac=args.pfac, threads=args.threads)
+            log.info("Finished 3D FFT of volume")
     else:
-        print("Please supply a map")
+        log.error("Please supply a map")
         return 1
 
-    f3d = vop.vol_ft(vol, pfac=args.pfac, threads=args.threads)
-    sz = f3d.shape[0] // 2 - 1
+    sz = (f3d.shape[0] - 3) // args.pfac
+    apix = star.calculate_apix(df) * np.double(args.size) / sz
     sx, sy = np.meshgrid(np.fft.rfftfreq(sz), np.fft.fftfreq(sz))
     s = np.sqrt(sx ** 2 + sy ** 2)
     a = np.arctan2(sy, sx)
+    log.info("Projection size is %d, unpadded volume size is %d" % (args.size, sz))
+    log.info("Effective pixel size is %f A/px" % apix)
+
+    if args.subtract and args.size != sz:
+        log.error("Volume and projections must be same size when subtracting")
+        return 1
+
+    if args.crop is not None and args.size // 2 < maxshift + args.crop // 2:
+        log.error("Some shifts are too large to crop (maximum crop is %d)" % (args.size - 2 * maxshift))
+        return 1
 
     ift = None
 
-    with mrc.ZSliceWriter(args.output) as zsw:
+    with mrc.ZSliceWriter(args.output, psz=apix) as zsw:
         for i, p in df.iterrows():
-            f2d = project(f3d, p, s, sx, sy, a, apply_ctf=args.ctf, size=args.size, flip_phase=args.flip)
+            f2d = project(f3d, p, s, sx, sy, a, pfac=args.pfac, apply_ctf=args.ctf, size=args.size, flip_phase=args.flip)
             if ift is None:
                 ift = irfft2(f2d.copy(),
-                             threads=cpu_count(),
+                             threads=args.threads,
                              planner_effort="FFTW_ESTIMATE",
                              auto_align_input=True,
                              auto_contiguous=True)
-            proj = fftshift(ift(f2d.copy(), np.zeros(vol.shape[:-1], dtype=vol.dtype)))
+            proj = fftshift(ift(f2d.copy(), np.zeros(ift.output_shape, dtype=ift.output_dtype)))
             log.debug("%f +/- %f" % (np.mean(proj), np.std(proj)))
             if args.subtract:
                 with mrc.ZSliceReader(p["ucsfImagePath"]) as zsr:
                     img = zsr.read(p["ucsfImageIndex"])
                 log.debug("%f +/- %f" % (np.mean(img), np.std(img)))
                 proj = img - proj
+            if args.crop is not None:
+                orihalf = args.size // 2
+                newhalf = args.crop // 2
+                x = orihalf - np.int(np.round(p[star.Relion.ORIGINX]))
+                y = orihalf - np.int(np.round(p[star.Relion.ORIGINY]))
+                proj = proj[y-newhalf:y+newhalf, x-newhalf:x+newhalf]
             zsw.write(proj)
-            log.info("%d@%s: %d/%d" % (p["ucsfImageIndex"], p["ucsfImagePath"], i + 1, df.shape[0]))
+            log.debug("%d@%s: %d/%d" % (p["ucsfImageIndex"], p["ucsfImagePath"], i + 1, df.shape[0]))
 
     if args.star is not None:
+        log.info("Writing output .star file")
+        if args.crop is not None:
+            df = star.recenter(df, inplace=True)
         if args.subtract:
             df[star.UCSF.IMAGE_ORIGINAL_PATH] = df[star.UCSF.IMAGE_PATH]
             df[star.UCSF.IMAGE_ORIGINAL_INDEX] = df[star.UCSF.IMAGE_INDEX]
@@ -85,16 +121,16 @@ def main(args):
     return 0
 
 
-def project(f3d, p, s, sx, sy, a, apply_ctf=False, size=None, flip_phase=False):
+def project(f3d, p, s, sx, sy, a, pfac=2, apply_ctf=False, size=None, flip_phase=False):
     orient = util.euler2rot(np.deg2rad(p[star.Relion.ANGLEROT]),
                             np.deg2rad(p[star.Relion.ANGLETILT]),
                             np.deg2rad(p[star.Relion.ANGLEPSI]))
     pshift = np.exp(-2 * np.pi * 1j * (-p[star.Relion.ORIGINX] * sx +
                                        -p[star.Relion.ORIGINY] * sy))
-    f2d = vop.interpolate_slice_numba(f3d, orient, size=size)
+    f2d = vop.interpolate_slice_numba(f3d, orient, pfac=pfac, size=size)
     f2d *= pshift
     if apply_ctf or flip_phase:
-        apix = star.calculate_apix(p)
+        apix = star.calculate_apix(p) * np.double(size) / (f3d.shape[0] // pfac - 1)
         c = ctf.eval_ctf(s / apix, a,
                          p[star.Relion.DEFOCUSU], p[star.Relion.DEFOCUSV],
                          p[star.Relion.DEFOCUSANGLE],
@@ -118,7 +154,8 @@ if __name__ == "__main__":
     parser.add_argument("--ctf", help="Apply CTF to projections", action="store_true")
     parser.add_argument("--flip", help="Only flip phases when applying CTF to projections", action="store_true")
     parser.add_argument("--pfac", help="Zero padding factor for 3D FFT (default: %(default)d)", type=int, default=2)
-    parser.add_argument("--size", help="Size of output projections", type=int)
+    parser.add_argument("--size", help="Size of projections (before subtraction)", type=int)
+    parser.add_argument("--crop", help="Size to crop recentered output images (after subtraction)", type=int)
     parser.add_argument("--star", help="Output STAR file with projection metadata")
     parser.add_argument("--subtract", help="Subtract projection from experimental images", action="store_true")
     parser.add_argument("--threads", "-j", help="Number of threads for FFTs (default: CPU count = %(default)d)",

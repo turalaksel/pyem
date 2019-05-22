@@ -17,34 +17,38 @@
 #
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
-from __future__ import print_function
-import glob
 import logging
+import json
 import numpy as np
 import os
 import os.path
 import sys
-import xml.etree.cElementTree as etree
+from pyem import geom
 from pyem import star
 from pyem import util
 
 
 def main(args):
     log = logging.getLogger(__name__)
-    log.setLevel(logging.INFO)
     hdlr = logging.StreamHandler(sys.stdout)
-    if args.quiet:
-        hdlr.setLevel(logging.WARNING)
-    else:
-        hdlr.setLevel(logging.INFO)
     log.addHandler(hdlr)
+    log.setLevel(logging.getLevelName(args.loglevel.upper()))
 
-    if args.target is None and args.sym is None:
-        log.error("At least a target or symmetry group must be provided via --target or --sym")
+    if args.target is None and args.sym is None and args.transform is None and args.euler is None:
+        log.error("At least a target, transformation matrix, Euler angles, or a symmetry group must be provided")
         return 1
     elif args.target is not None and args.boxsize is None and args.origin is None:
         log.error("An origin must be provided via --boxsize or --origin")
         return 1
+
+    if args.apix is None:
+        df = star.parse_star(args.input, nrows=1)
+        args.apix = star.calculate_apix(df)
+        if args.apix is None:
+            log.warn("Could not compute pixel size, default is 1.0 Angstroms per pixel")
+            args.apix = 1.0
+            df[star.Relion.MAGNIFICATION] = 10000
+            df[star.Relion.DETECTORPIXELSIZE] = 1.0
 
     if args.target is not None:
         try:
@@ -53,49 +57,76 @@ def main(args):
             log.error("Target must be comma-separated list of x,y,z coordinates")
             return 1
 
+    if args.euler is not None:
+        try:
+            args.euler = np.deg2rad(np.array([np.double(tok) for tok in args.euler.split(",")]))
+            args.transform = np.zeros((3, 4))
+            args.transform[:, :3] = geom.euler2rot(*args.euler)
+            if args.target is not None:
+                args.transform[:, -1] = args.target
+        except:
+            log.error("Euler angles must be comma-separated list of rotation, tilt, skew in degrees")
+            return 1
+
+    if args.transform is not None and not hasattr(args.transform, "dtype"):
+        if args.target is not None:
+            log.warn("--target supersedes --transform")
+        try:
+            args.transform = np.array(json.loads(args.transform))
+        except:
+            log.error("Transformation matrix must be in JSON/Numpy format")
+            return 1
+
     if args.origin is not None:
         if args.boxsize is not None:
             log.warn("--origin supersedes --boxsize")
         try:
             args.origin = np.array([np.double(tok) for tok in args.origin.split(",")])
+            args.origin /= args.apix
         except:
             log.error("Origin must be comma-separated list of x,y,z coordinates")
             return 1
+    elif args.boxsize is not None:
+        args.origin = np.ones(3) * args.boxsize / 2
     
     if args.sym is not None:
         args.sym = util.relion_symmetry_group(args.sym)
 
     df = star.parse_star(args.input)
 
-    if args.apix is None:
-        args.apix = star.calculate_apix(df)
-        if args.apix is None:
-            log.warn("Could not compute pixel size, default is 1.0 Angstroms per pixel")
-            args.apix = 1.0
-            df[star.Relion.MAGNIFICATION] = 10000
-            df[star.DETECTORPIXELSIZE] = 1.0
+    if star.calculate_apix(df) != args.apix:
+        log.warn("Using specified pixel size of %f instead of calculated size %f" %
+                 (args.apix, star.calculate_apix(df)))
 
     if args.cls is not None:
         df = star.select_classes(df, args.cls)
 
     if args.target is not None:
-        if args.origin is not None:
-            args.origin /= args.apix
-        elif args.boxsize is not None:
-            args.origin = np.ones(3) * args.boxsize / 2
         args.target /= args.apix
         c = args.target - args.origin
         c = np.where(np.abs(c) < 1, 0, c)  # Ignore very small coordinates.
         d = np.linalg.norm(c)
         ax = c / d
-        cm = util.euler2rot(*np.array([np.arctan2(ax[1], ax[0]), np.arccos(ax[2]), np.deg2rad(args.psi)]))
-        ops = [op.dot(cm) for op in args.sym] if args.sym is not None else [cm]
-        dfs = [star.transform_star(df, op.T, -d, rotate=args.shift_only, invert=args.target_invert, adjust_defocus=args.adjust_defocus) for op in ops]
+        r = geom.euler2rot(*np.array([np.arctan2(ax[1], ax[0]), np.arccos(ax[2]), np.deg2rad(args.psi)]))
+        d = -d
+    elif args.transform is not None:
+        r = args.transform[:, :3]
+        if args.transform.shape[1] == 4:
+            d = args.transform[:, -1] / args.apix
+            d = r.dot(args.origin) + d - args.origin
+        else:
+            d = 0
     elif args.sym is not None:
-        dfs = list(subparticle_expansion(df, args.sym, -args.displacement / args.apix))
+        r = np.identity(3)
+        d = -args.displacement / args.apix
     else:
         log.error("At least a target or symmetry group must be provided via --target or --sym")
         return 1
+
+    log.debug("Final rotation: %s" % str(r).replace("\n", "\n" + " " * 16))
+    ops = [op.dot(r.T) for op in args.sym] if args.sym is not None else [r.T]
+    log.debug("Final translation: %s (%f px)" % (str(d), np.linalg.norm(d)))
+    dfs = list(subparticle_expansion(df, ops, d, rotate=args.shift_only, invert=args.invert, adjust_defocus=args.adjust_defocus))
  
     if args.recenter:
         for s in dfs:
@@ -113,17 +144,20 @@ def main(args):
     return 0
 
 
-def subparticle_expansion(s, ops=[np.eye(3)], dists=None, rots=None):
+def subparticle_expansion(s, ops=None, dists=0, rots=None, rotate=True, invert=False, adjust_defocus=False):
+    log = logging.getLogger(__name__)
+    if ops is None:
+        ops = [np.eye(3)]
     if rots is None:
-        rots = [util.euler2rot(*np.deg2rad(r[1])) for r in s[star.Relion.ANGLES].iterrows()]
-    if dists is not None:
-        if np.isscalar(dists):
-            dists = [dists] * len(ops)
-        for i in range(len(ops)):
-            yield star.transform_star(s, ops[i], dists[i], rots=rots)
-    else:
-        for op in ops:
-            yield star.transform_star(s, op, rots=rots)
+        rots = geom.e2r_vec(np.deg2rad(s[star.Relion.ANGLES].values))
+    dists = np.atleast_2d(dists)
+    if len(dists) == 1:
+        dists = np.repeat(dists, len(ops), axis=0)
+    for i in range(len(ops)):
+        log.debug("Yielding expansion %d" % i)
+        log.debug("Rotation: %s" % str(ops[i]).replace("\n", "\n" + " " * 10))
+        log.debug("Translation: %s (%f px)" % (str(dists[i]), np.linalg.norm(dists[i])))
+        yield star.transform_star(s, ops[i], dists[i], rots=rots, rotate=rotate, invert=invert, adjust_defocus=adjust_defocus)
 
 
 if __name__ == "__main__":
@@ -139,13 +173,16 @@ if __name__ == "__main__":
                         type=float, default=0)
     parser.add_argument("--origin", help="Origin coordinates in Angstroms", metavar="x,y,z")
     parser.add_argument("--target", help="Target coordinates in Angstroms", metavar="x,y,z")
-    parser.add_argument("--target-invert", help="Undo target pose transformation", action="store_true")
+    parser.add_argument("--invert", help="Invert the transformation", action="store_true")
+    parser.add_argument("--target-invert", action="store_true", dest="invert", help=argparse.SUPPRESS)
     parser.add_argument("--psi", help="Additional in-plane rotation of target in degrees", type=float, default=0)
+    parser.add_argument("--euler", help="Euler angles (ZYZ intrinsic) to rotate particles", metavar="rot,tilt,psi")
+    parser.add_argument("--transform", help="Transformation matrix (3x3 or 3x4) in Numpy format")
     parser.add_argument("--recenter", help="Recenter subparticle coordinates by subtracting X and Y shifts (e.g. for "
                                            "extracting outside Relion)", action="store_true")
     parser.add_argument("--adjust-defocus", help="Add Z component of shifts to defocus", action="store_true")
     parser.add_argument("--shift-only", help="Keep original view axis after target transformation", action="store_false")
-    parser.add_argument("--quiet", help="Don't print info messages", action="store_true")
+    parser.add_argument("--loglevel", "-l", type=str, default="WARNING", help="Logging level and debug output")
     parser.add_argument("--skip-join", help="Force multiple output files even if no suffix provided",
                         action="store_true", default=False)
     parser.add_argument("--suffix", help="Suffix for multiple output files")

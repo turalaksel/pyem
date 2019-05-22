@@ -20,8 +20,10 @@
 import logging
 import numpy as np
 import pandas as pd
+import sys
 from math import modf
 from . import star
+from . import geom
 from . import util
 
 
@@ -81,7 +83,7 @@ def parse_fx_par(fn):
 
 
 def write_fx_par(fn, df):
-    formatters = {"C": "%d",
+    formatters = {"C": lambda x: "%d" % d,
                   "PSI": lambda x: "%0.2f" % x,
                   "THETA": lambda x: "%0.2f" % x,
                   "PHI": lambda x: "%0.2f" % x,
@@ -98,7 +100,8 @@ def write_fx_par(fn, df):
                   "SIGMA": lambda x: "%0.4f" % x,
                   "SCORE": lambda x: "%0.2f" % x,
                   "CHANGE": lambda x: "%0.2f" % x}
-    df.to_csv(fn, sep="\s", formatters=formatters, index=False)
+    with open(fn, 'w') as f:
+        f.write(df.to_string(formatters=formatters, index=False))
 
 
 def par2star(par, data_path, apix=1.0, cs=2.0, ac=0.07, kv=300, invert_eulers=True):
@@ -222,16 +225,14 @@ def cryosparc_065_csv2star(meta, minphic=0):
                 df[model[p]] = meta[p]
         df["rlnClassNumber"] = 1
     if df.columns.intersection(star.Relion.ANGLES).size == len(star.Relion.ANGLES):
-        df[star.Relion.ANGLES] = np.rad2deg(
-            df[star.Relion.ANGLES].apply(lambda x: util.rot2euler(util.expmap(x)),
-                                         axis=1, raw=True, broadcast=True))
+        df[star.Relion.ANGLES]  = np.rad2deg(geom.rot2euler(geom.expmap(df[star.Relion.ANGLES].values)))
     if phic is not None and minphic > 0:
         mask = np.all(phic < minphic, axis=1)
         df.drop(df[mask].index, inplace=True)
     return df
 
 
-def parse_cryosparc_2_cs(csfile, passthrough=None, minphic=0):
+def parse_cryosparc_2_cs(csfile, passthrough=None, minphic=0, boxsize=None, swapxy=False):
     micrograph = {u'micrograph_blob/path': star.Relion.MICROGRAPH_NAME,
                   u'micrograph_blob/psize_A': star.Relion.DETECTORPIXELSIZE,
                   u'mscope_params/accel_kv': None,
@@ -309,6 +310,12 @@ def parse_cryosparc_2_cs(csfile, passthrough=None, minphic=0):
             log.debug("Merging micrograph fields: %s" % ", ".join(fields))
             df = star.smart_merge(df, pt, fields=fields, key=key)
 
+    if sys.version_info >= (3, 0):
+        if star.Relion.MICROGRAPH_NAME in df:
+            df[star.Relion.MICROGRAPH_NAME] = df[star.Relion.MICROGRAPH_NAME].apply(lambda x: x.decode('UTF-8'))
+        if star.UCSF.IMAGE_PATH in df:
+            df[star.UCSF.IMAGE_PATH] = df[star.UCSF.IMAGE_PATH].apply(lambda x: x.decode('UTF-8'))
+
     star.simplify_star_ucsf(df)
     df[star.Relion.MAGNIFICATION] = 10000.0
     log.info("Directly copied fields: %s" % ", ".join(df.columns))
@@ -318,16 +325,19 @@ def parse_cryosparc_2_cs(csfile, passthrough=None, minphic=0):
         df[star.Relion.COORDX] = cs[u'location/center_x_frac']
         df[star.Relion.COORDY] = cs[u'location/center_y_frac']
         # df[star.Relion.MICROGRAPH_NAME] = cs[u'location/micrograph_path']
-        # x and y dimensions are reversed in cryosparc's micrograph shape
-        df[star.Relion.COORDS] = np.round(np.array(df[star.Relion.COORDS]) * cs['location/micrograph_shape'][:, [1, 0]])
-        log.info("Converted particle coordinates from normalized to absolute with subpixel origin")
+
+        if swapxy:
+            df[star.Relion.COORDS] = np.round(df[star.Relion.COORDS] *
+                                              cs['location/micrograph_shape'][:, ::-1]).astype(np.int)
+        else:
+            df[star.Relion.COORDS] = np.round(df[star.Relion.COORDS] * cs['location/micrograph_shape']).astype(np.int)
+        log.info("Converted particle coordinates from normalized to absolute")
 
     if star.Relion.DEFOCUSANGLE in df:
         log.debug("Converting DEFOCUSANGLE from degrees to radians")
         df[star.Relion.DEFOCUSANGLE] = np.rad2deg(df[star.Relion.DEFOCUSANGLE])
     elif star.Relion.DEFOCUSV in df and star.Relion.DEFOCUSU in df:
-        df[star.Relion.DEFOCUSANGLE] = np.rad2deg(np.arctan2(df[star.Relion.DEFOCUSV], df[star.Relion.DEFOCUSU]))
-        log.info("Calculated missing defocus angle")
+        log.warn("Defocus angles not found")
     else:
         log.info("Defocus values not found")
 
@@ -360,6 +370,9 @@ def parse_cryosparc_2_cs(csfile, passthrough=None, minphic=0):
     else:
         log.info("Classification parameters not found")
 
+    if star.Relion.ORIGINX in df.columns and boxsize is not None:
+        df[star.Relion.ORIGINS] *= cs["blob/shape"][0] / boxsize
+
     if star.Relion.RANDOMSUBSET in df.columns:
         log.debug("Changing RANDOMSUBSET to 1-based index")
         df[star.Relion.RANDOMSUBSET] += 1
@@ -370,10 +383,7 @@ def parse_cryosparc_2_cs(csfile, passthrough=None, minphic=0):
 
     if df.columns.intersection(star.Relion.ANGLES).size == len(star.Relion.ANGLES):
         log.debug("Converting Rodrigues coordinates to Euler angles")
-        df[star.Relion.ANGLES] = np.rad2deg(
-                df[star.Relion.ANGLES].apply(
-                    lambda x: util.rot2euler(util.expmap(x)),
-                    axis=1, raw=True, result_type='broadcast'))
+        df[star.Relion.ANGLES]  = np.rad2deg(geom.rot2euler(geom.expmap(df[star.Relion.ANGLES].values)))
         log.info("Converted Rodrigues coordinates to Euler angles")
     elif star.Relion.ANGLEPSI in df:
         log.debug("Converting ANGLEPSI from degrees to radians")
@@ -381,3 +391,4 @@ def parse_cryosparc_2_cs(csfile, passthrough=None, minphic=0):
     else:
         log.info("Angular alignment parameters not found")
     return df
+
