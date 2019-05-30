@@ -29,9 +29,10 @@ except ImportError:
     import queue
 import sys
 import threading
+import scipy.ndimage
 from multiprocessing import cpu_count
 from multiprocessing.dummy import Pool
-from numpy.fft import fftshift
+from numpy.fft import fftshift, rfft2
 from pyem import mrc
 from pyem import star
 from pyem import algo
@@ -118,6 +119,16 @@ def main(args):
     apix = star.calculate_apix(df)
     log.info("Computed pixel size is %f A" % apix)
 
+    # Read particle diameter in Angstrom
+
+    if args.diameter:
+        radius_pix = 0.5*args.diameter//apix
+    else:
+        radius_pix = None
+
+    # Create particle mask
+    p1rmask = circular_mask(submap_ft.shape[:2], radius=radius_pix, soft_edge=4)
+
     log.debug("Grouping particles by output stack")
     gb = df.groupby(star.UCSF.IMAGE_PATH)
 
@@ -132,7 +143,7 @@ def main(args):
     log.info("Instantiating thread pool with %d workers" % args.threads)
     pool = Pool(processes=args.threads, initializer=init)
     threads = []
-    
+
     log.info("Performing projection subtraction")
 
     try:
@@ -142,7 +153,7 @@ def main(args):
             log.debug("Create producer for %s" % fname)
             prod = threading.Thread(
                 target=producer,
-                args=(pool, queue, submap_ft, refmap_ft, fname, particles,
+                args=(pool, queue, p1rmask, submap_ft, refmap_ft, fname, particles,
                       sx, sy, s, a, apix, coefs_method, r, nr, fftthreads, args.crop, args.pfac))
             log.debug("Create consumer for %s" % fname)
             cons = threading.Thread(
@@ -180,7 +191,32 @@ def main(args):
     return 0
 
 
-def subtract_outer(p1r, ptcl, submap_ft, refmap_ft, sx, sy, s, a, apix, coefs_method, r, nr, **kwargs):
+def circular_mask(shape, center=None, radius=None, soft_edge=None):
+
+    # Determine the radius
+    radius = int(radius)
+
+    # use the middle of the image
+    if center is None:
+        center = [shape[1]//2, shape[0]//2]
+
+    # use the smallest distance between the center and image walls
+    if radius is None:
+        radius = min(center[0], center[1], shape[1]-center[0], shape[0]-center[1])
+
+    Y, X = np.ogrid[:shape[0], :shape[1]]
+    dist_from_center = np.sqrt((X - center[0])**2 + (Y-center[1])**2)
+
+    mask = dist_from_center <= radius
+
+    # Check for the soft edge width
+    if soft_edge is not None:
+        mask = scipy.ndimage.filters.gaussian_filter(mask, soft_edge)
+
+    return np.array(mask, dtype='float32')
+
+
+def subtract_outer(p1r, p1rmask, ptcl, submap_ft, refmap_ft, sx, sy, s, a, apix, coefs_method, r, nr, **kwargs):
     log = logging.getLogger('root')
     log.debug("%d@%s Exp %f +/- %f" % (ptcl[star.UCSF.IMAGE_ORIGINAL_INDEX], ptcl[star.UCSF.IMAGE_ORIGINAL_PATH], np.mean(p1r), np.std(p1r)))
     ft = getattr(tls, 'ft', None)
@@ -192,7 +228,7 @@ def subtract_outer(p1r, ptcl, submap_ft, refmap_ft, sx, sy, s, a, apix, coefs_me
                    auto_contiguous=True)
         tls.ft = ft
     if coefs_method >= 1:
-        p1 = ft(p1r.copy(), np.zeros(ft.output_shape, dtype=ft.output_dtype)).copy()
+        p1 = ft((p1r*p1rmask).copy(), np.zeros(ft.output_shape, dtype=ft.output_dtype)).copy()
     else:
         p1 = np.empty(ft.output_shape, ft.output_dtype)
 
@@ -243,19 +279,22 @@ def subtract(p1, submap_ft, refmap_ft,
     return p1s
 
 
-def producer(pool, queue, submap_ft, refmap_ft, fname, particles,
+def producer(pool, queue, p1rmask, submap_ft, refmap_ft, fname, particles,
              sx, sy, s, a, apix, coefs_method, r, nr, fftthreads=1, crop=None, pfac=2):
     log = logging.getLogger('root')
     log.debug("Producing %s" % fname)
     zreader = mrc.ZSliceReader(particles[star.UCSF.IMAGE_ORIGINAL_PATH].iloc[0])
     for i, ptcl in particles.iterrows():
+        # Shift particle mask
+        p1rmask_shifted = scipy.ndimage.shift(p1rmask, shift=[-ptcl[star.Relion.ORIGINX], -ptcl[star.Relion.ORIGINY]])
+
         log.debug("Produce %d@%s" % (ptcl[star.UCSF.IMAGE_ORIGINAL_INDEX], ptcl[star.UCSF.IMAGE_ORIGINAL_PATH]))
         # p1r = mrc.read_imgs(stack[i], idx[i] - 1, compat="relion")
         p1r = zreader.read(ptcl[star.UCSF.IMAGE_ORIGINAL_INDEX])
         log.debug("Apply")
         ri = pool.apply_async(
             subtract_outer,
-            (p1r, ptcl, submap_ft, refmap_ft, sx, sy, s, a, apix, coefs_method, r, nr),
+            (p1r, p1rmask_shifted, ptcl, submap_ft, refmap_ft, sx, sy, s, a, apix, coefs_method, r, nr),
             {"fftthreads": fftthreads, "crop": crop, "pfac": pfac})
         log.debug("Put")
         queue.put((ptcl[star.UCSF.IMAGE_INDEX], ri), block=True)
@@ -294,6 +333,7 @@ if __name__ == "__main__":
     parser.add_argument("output", type=str,
                         help="STAR file with subtracted particles)")
     parser.add_argument("--dest", "-d", type=str, help="Destination directory for subtracted particle stacks")
+    parser.add_argument("--diameter", "-R", type=float, help="Particle diameter in Angstroms", default=None)
     parser.add_argument("--refmap", "-r", type=str, help=argparse.SUPPRESS)
     parser.add_argument("--submap", "-s", type=str, help="Map used to calculate subtracted projections")
     parser.add_argument("--refmap_ft", type=str, help=argparse.SUPPRESS)
