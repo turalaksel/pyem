@@ -23,6 +23,7 @@ import logging
 import numba
 import numpy as np
 import os.path
+import glob
 try:
     import Queue
 except ImportError:
@@ -54,9 +55,25 @@ def main(args):
     log.addHandler(hdlr)
     log.setLevel(logging.getLevelName(args.loglevel.upper()))
 
-    if args.dest is None and args.suffix == "":
-        args.dest = ""
-        args.suffix = "_subtracted"
+    # Set destination directory
+    args.dest = set_output_directory(args.dest)
+
+    # Make symlinks to input
+    make_symlink2parent(args.input, args.dest, out_path='particle_input')
+
+    if args.submap is not None:
+        # Make symlinks to input
+        make_symlink2parent(args.submap, args.dest, out_path='submap')
+
+    if args.submask is not None:
+        # Make symlinks to input
+        make_symlink2parent(args.submask, args.dest, out_path='submask')
+
+    # Prepare output files
+    output_star, output_mrcs = prepare_output_files(args.dest)
+
+    # Suffix
+    args.suffix = "_subtracted"
 
     log.info("Reading particle .star file")
     df = star.parse_star(args.input, keep_index=False)
@@ -186,10 +203,70 @@ def main(args):
     if args.crop is not None:
         df = star.recenter(df, inplace=True)
     star.simplify_star_ucsf(df)
-    star.write_star(args.output, df, reindex=True)
+    star.write_star(output_star, df, reindex=True)
 
     return 0
 
+def prepare_output_files(output_directory):
+    '''
+    Create output files
+    '''
+
+    subtracted_star_file = os.path.relpath(os.path.abspath(output_directory+'/subtracted.star'))
+    subtracted_mrc_file  = os.path.relpath(os.path.abspath(output_directory+'/subtracted.mrcs'))
+
+    return subtracted_star_file, subtracted_mrc_file
+
+def make_symlink2parent(input_file, output_directory, out_path='particle_input'):
+    '''
+    Make symlink to input file folder
+    '''
+    # Split input file
+    head, tail = os.path.split(input_file)
+
+    # Get relative directory to input file folder
+    relative_input_dir = os.path.abspath(head)
+
+    # Destination directory
+    relative_output_dir = os.path.relpath(os.path.abspath(output_directory+'/'+out_path))
+
+    # Create symlink
+    os.symlink(relative_input_dir, relative_output_dir)
+
+
+def set_output_directory(out_dir=None, project_root='.'):
+    '''
+    Set output directory
+    '''
+
+    if out_dir is not None:
+        output_directory = out_dir
+    else:
+        # Get project root
+        head = project_root
+
+        # Directory head
+        dir_head = 'YifanSubtract3D'
+
+        # List existing output directories
+        potential_directories = list(filter(lambda x: os.path.isdir(x),
+                                     glob.glob(head+'/'+dir_head+'_em_[0-9][0-9][0-9]')))
+
+        # Get the number extensions
+        number_extensions = [int(x[-3:]) for x in potential_directories]
+
+        # Get the counter
+        output_counter = 1
+        if len(number_extensions) > 0:
+            output_counter = max(number_extensions)+1
+
+        output_directory = head+'/'+dir_head+"_em_%03d" % (output_counter)
+
+    # Make directory
+    if not os.path.isdir(output_directory):
+        os.mkdir(output_directory)
+
+    return os.path.relpath(os.path.abspath(output_directory))
 
 def circular_mask(shape, center=None, radius=None, soft_edge=None):
 
@@ -327,10 +404,8 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(version="projection_subtraction.py 2.1b")
-    parser.add_argument("input", type=str,
+    parser.add_argument("--input", "-i", type=str,
                         help="STAR file with original particles")
-    parser.add_argument("output", type=str,
-                        help="STAR file with subtracted particles)")
     parser.add_argument("--dest", "-d", type=str, help="Destination directory for subtracted particle stacks")
     parser.add_argument("--diameter", "-R", type=float, help="Particle diameter in Angstroms", default=None)
     parser.add_argument("--refmap", "-r", type=str, help=argparse.SUPPRESS)
@@ -339,7 +414,7 @@ if __name__ == "__main__":
     parser.add_argument("--submap_ft", type=str, help=argparse.SUPPRESS)
     parser.add_argument("--submask", type=str, help="Mask to apply to submap before subtracting")
     parser.add_argument("--original", help="Read original particle images instead of current", action="store_true")
-    parser.add_argument("--threads", "-j", type=int, default=None, help="Number of simultaneous threads")
+    parser.add_argument("--threads", "-j", type=int, default=50, help="Number of simultaneous threads")
     parser.add_argument("--io-thread-pairs", type=int, default=1)
     parser.add_argument("--io-queue-length", type=int, default=1000)
     parser.add_argument("--fft-threads", type=int, default=1)
