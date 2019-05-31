@@ -122,12 +122,12 @@ def main(args):
     # Read particle diameter in Angstrom
 
     if args.diameter:
-        radius_pix = 0.5*args.diameter//apix
+        radius_pix = int(0.5*args.diameter/apix)
     else:
         radius_pix = None
 
     # Create particle mask
-    p1rmask = circular_mask(submap_ft.shape[:2], radius=radius_pix, soft_edge=4)
+    p1rmask = circular_mask(submap.shape[:2], radius=radius_pix, soft_edge=4)
 
     log.debug("Grouping particles by output stack")
     gb = df.groupby(star.UCSF.IMAGE_PATH)
@@ -193,9 +193,6 @@ def main(args):
 
 def circular_mask(shape, center=None, radius=None, soft_edge=None):
 
-    # Determine the radius
-    radius = int(radius)
-
     # use the middle of the image
     if center is None:
         center = [shape[1]//2, shape[0]//2]
@@ -203,17 +200,19 @@ def circular_mask(shape, center=None, radius=None, soft_edge=None):
     # use the smallest distance between the center and image walls
     if radius is None:
         radius = min(center[0], center[1], shape[1]-center[0], shape[0]-center[1])
+    else:
+        radius = int(radius)
 
     Y, X = np.ogrid[:shape[0], :shape[1]]
     dist_from_center = np.sqrt((X - center[0])**2 + (Y-center[1])**2)
 
-    mask = dist_from_center <= radius
+    mask = np.array(dist_from_center <= radius, dtype=np.float32)
 
     # Check for the soft edge width
     if soft_edge is not None:
         mask = scipy.ndimage.filters.gaussian_filter(mask, soft_edge)
 
-    return np.array(mask, dtype='float32')
+    return mask
 
 
 def subtract_outer(p1r, p1rmask, ptcl, submap_ft, refmap_ft, sx, sy, s, a, apix, coefs_method, r, nr, **kwargs):
