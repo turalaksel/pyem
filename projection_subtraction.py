@@ -236,7 +236,7 @@ def clip_img(img, new_dim):
     if n_img % 2 > 0 or new_dim % 2 > 0:
         sys.exit('Previous Img size or the new image size is not an even number')
 
-    clip_n = (new_dim - n_img) / 2
+    clip_n = (n_img - new_dim) / 2
 
     # Clip factor
     return img[clip_n:-clip_n, clip_n:-clip_n]
@@ -416,6 +416,7 @@ def subtract(p1, submap_ft, refmap_ft,
         coefs = np.take(frc, r)
         # p1s = p1 - p2 * c * coefs
         p1s = p2 * c * coefs
+
     return p1s
 
 
@@ -431,6 +432,7 @@ def producer(pool, queue, p1rmask, submap_ft, refmap_ft, fname, particles,
         log.debug("Produce %d@%s" % (ptcl[star.UCSF.IMAGE_ORIGINAL_INDEX], ptcl[star.UCSF.IMAGE_ORIGINAL_PATH]))
         # p1r = mrc.read_imgs(stack[i], idx[i] - 1, compat="relion")
         p1r = zreader.read(ptcl[star.UCSF.IMAGE_ORIGINAL_INDEX])
+
         log.debug("Apply")
         ri = pool.apply_async(
             subtract_outer,
