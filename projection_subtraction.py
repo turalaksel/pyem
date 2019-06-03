@@ -90,6 +90,9 @@ def main(args):
             args.prefix +
             os.path.basename(x).replace(".mrcs", args.suffix + ".mrcs")))
 
+    # Read first image
+    first_p1r = read_first_mrc(df)
+
     if args.submap_ft is None:
         log.info("Reading volume")
         submap = mrc.read(args.submap, inc_header=False, compat="relion")
@@ -207,6 +210,57 @@ def main(args):
 
     return 0
 
+
+def read_first_mrc(particles):
+    '''
+    Read first mrc in a star file
+    '''
+    zreader    = mrc.ZSliceReader(particles[star.UCSF.IMAGE_ORIGINAL_PATH].iloc[0])
+    first_ptcl = particles.iloc[0]
+
+    p1r = zreader.read(first_ptcl[star.UCSF.IMAGE_ORIGINAL_INDEX])
+
+    return p1r
+
+
+def clip_img(img, new_dim):
+    '''
+    Clip img to new dimension
+    '''
+    n_img = img.shape[0]
+
+    # If the dimensions are the same skip clipping
+    if n_img == new_dim:
+        return img
+
+    if n_img % 2 > 0 or new_dim % 2 > 0:
+        sys.exit('Previous Img size or the new image size is not an even number')
+
+    clip_n = (new_dim - n_img) / 2
+
+    # Clip factor
+    return img[clip_n:-clip_n, clip_n:-clip_n]
+
+
+def zero_pad(img, n_max):
+    '''
+    Zero pad img - make sure img shape and n-max are even numbers
+    '''
+    n_img = img.shape[0]
+
+    # If the dimensions are the same skip clipping
+    if n_img == n_max:
+        return img
+
+    if n_img % 2 > 0 or n_max % 2 > 0:
+        sys.exit('Previous Img size or the new image size is not an even number')
+
+    # Padding amount
+    n_pad = (n_max - n_img) / 2
+
+    return np.pad(img, n_pad, 'constant', constant_values=0)
+
+
 def prepare_output_files(output_directory):
     '''
     Create output files
@@ -216,6 +270,7 @@ def prepare_output_files(output_directory):
     subtracted_mrc_file  = os.path.relpath(os.path.abspath(output_directory+'/subtracted.mrcs'))
 
     return subtracted_star_file, subtracted_mrc_file
+
 
 def make_symlink2parent(input_file, output_directory, out_path='particle_input'):
     '''
@@ -268,6 +323,7 @@ def set_output_directory(out_dir=None, project_root='.'):
 
     return os.path.relpath(os.path.abspath(output_directory))
 
+
 def circular_mask(shape, center=None, radius=None, soft_edge=None):
 
     # use the middle of the image
@@ -296,15 +352,19 @@ def subtract_outer(p1r, p1rmask, ptcl, submap_ft, refmap_ft, sx, sy, s, a, apix,
     log = logging.getLogger('root')
     log.debug("%d@%s Exp %f +/- %f" % (ptcl[star.UCSF.IMAGE_ORIGINAL_INDEX], ptcl[star.UCSF.IMAGE_ORIGINAL_PATH], np.mean(p1r), np.std(p1r)))
     ft = getattr(tls, 'ft', None)
+
+    # Clip p1r to match to map dimensions
+    p1r_clipped = clip_img(p1r, p1rmask.shape[0])*p1rmask
+
     if ft is None:
-        ft = rfft2(fftshift(p1r.copy()), threads=kwargs["fftthreads"],
+        ft = rfft2(fftshift(p1r_clipped.copy()), threads=kwargs["fftthreads"],
                    planner_effort="FFTW_ESTIMATE",
                    overwrite_input=False,
                    auto_align_input=True,
                    auto_contiguous=True)
         tls.ft = ft
     if coefs_method >= 1:
-        p1 = ft((p1r*p1rmask).copy(), np.zeros(ft.output_shape, dtype=ft.output_dtype)).copy()
+        p1 = ft(p1r_clipped.copy(), np.zeros(ft.output_shape, dtype=ft.output_dtype)).copy()
     else:
         p1 = np.empty(ft.output_shape, ft.output_dtype)
 
@@ -322,6 +382,10 @@ def subtract_outer(p1r, p1rmask, ptcl, submap_ft, refmap_ft, sx, sy, s, a, apix,
                      auto_contiguous=True)
         tls.ift = ift
     p1sr = fftshift(ift(p1s.copy(), np.zeros(ift.output_shape, dtype=ift.output_dtype)).copy())
+
+    # Zero pad p1sr
+    p1sr = zero_pad(p1sr, p1r.shape[0])
+
     log.debug("%d@%s Exp %f +/- %f, Sub %f +/- %f" % (ptcl[star.UCSF.IMAGE_ORIGINAL_INDEX], ptcl[star.UCSF.IMAGE_ORIGINAL_PATH], np.mean(p1r), np.std(p1r), np.mean(p1sr), np.std(p1sr)))
     new_image = p1r - p1sr
     if kwargs["crop"] is not None:
